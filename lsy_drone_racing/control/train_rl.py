@@ -138,6 +138,8 @@ class RandTrajEnv(DroneEnv):
         freq: int = 500,
         disturbances: ConfigDict | None = None,
         device: str = "cpu",
+        gate_positions: np.ndarray | None = None,
+        gate_pos_randomization: dict | None = None,
     ):
         """Initialize the environment and create the figure-eight trajectory.
 
@@ -203,25 +205,64 @@ class RandTrajEnv(DroneEnv):
         self.single_observation_space = spaces.Dict(spec)
         self.observation_space = batch_space(self.single_observation_space, self.sim.n_worlds)
 
+        # Gate-aware trajectory settings
+        self.gate_positions = gate_positions  # (n_gates, 3) or None
+        self.gate_pos_randomization = gate_pos_randomization  # {'minval': [...], 'maxval': [...]}
+
     def reset(
         self, *, seed: int | None = None, options: dict | None = None
     ) -> tuple[dict[str, Array], dict]:
         """Reset."""
-        # Create a random trajectory based on spline interpolation
         t = np.linspace(0, self.trajectory_time, self.n_steps)
-        scale = np.array([1.2, 1.2, 0.5])
-        waypoints = (
-            np.random.uniform(-1, 1, size=(self.sim.n_worlds, self.num_waypoints, 3)) * scale
-        )
-        waypoints = (
-            waypoints + 0.3 * self.takeoff_pos + np.array([0.0, 0.0, 0.7])
-        )  # shift up in z direction
-        waypoints[:, :3, :] = np.array(
-            [[-1.5, 1.0, 0.07], [-1.0, 0.55, 0.4], [0.3, 0.35, 0.7]]
-        )  # set first three waypoints
         v0 = np.tile(np.array([[0.0, 0.0, 0.4]]), (self.sim.n_worlds, 1))  # takeoff velocity
+
+        if self.gate_positions is not None:
+            # Gate-aware trajectory: spline through randomized gate positions
+            n_gates = self.gate_positions.shape[0]
+            gate_pos = np.tile(
+                self.gate_positions, (self.sim.n_worlds, 1, 1)
+            )  # (n_worlds, n_gates, 3)
+
+            # Apply L2-style randomization to gate positions
+            if self.gate_pos_randomization is not None:
+                minval = np.array(self.gate_pos_randomization["minval"])
+                maxval = np.array(self.gate_pos_randomization["maxval"])
+                noise = np.random.uniform(
+                    minval, maxval, size=(self.sim.n_worlds, n_gates, 3)
+                )
+                gate_pos = gate_pos + noise
+
+            # Build waypoints: takeoff(1) + climbout(1) + (approach + gate) * n_gates
+            num_wp = 2 + 2 * n_gates
+            waypoints = np.zeros((self.sim.n_worlds, num_wp, 3))
+            waypoints[:, 0, :] = self.takeoff_pos  # [-1.5, 1.0, 0.07]
+            waypoints[:, 1, :] = np.array([-1.0, 0.55, 0.4])  # climbout
+
+            prev_pos = waypoints[:, 1, :]  # (n_worlds, 3)
+            for i in range(n_gates):
+                # Approach midpoint between previous position and gate
+                mid = (prev_pos + gate_pos[:, i, :]) / 2
+                mid += np.random.uniform(-0.1, 0.1, size=(self.sim.n_worlds, 3))
+                mid[:, 2] = np.maximum(mid[:, 2], 0.15)  # min altitude safety
+                waypoints[:, 2 + 2 * i, :] = mid
+                waypoints[:, 3 + 2 * i, :] = gate_pos[:, i, :]
+                prev_pos = gate_pos[:, i, :]
+        else:
+            # Original random trajectory
+            num_wp = self.num_waypoints
+            scale = np.array([1.2, 1.2, 0.5])
+            waypoints = (
+                np.random.uniform(-1, 1, size=(self.sim.n_worlds, num_wp, 3)) * scale
+            )
+            waypoints = (
+                waypoints + 0.3 * self.takeoff_pos + np.array([0.0, 0.0, 0.7])
+            )  # shift up in z direction
+            waypoints[:, :3, :] = np.array(
+                [[-1.5, 1.0, 0.07], [-1.0, 0.55, 0.4], [0.3, 0.35, 0.7]]
+            )  # set first three waypoints
+
         spline = CubicSpline(
-            np.linspace(0, self.trajectory_time, self.num_waypoints),
+            np.linspace(0, self.trajectory_time, num_wp),
             waypoints,
             axis=1,
             bc_type=((1, v0), "not-a-knot"),
@@ -475,6 +516,20 @@ def make_envs(
 ) -> VectorEnv:
     """Make environments for training RL policy."""
     config = load_config(Path(__file__).parents[2] / "config" / config)
+
+    # Extract gate info for gate-aware trajectory generation
+    gate_positions = None
+    gate_pos_randomization = None
+    if coefs.get("gate_aware", False):
+        gates = config.env.track.gates
+        gate_positions = np.array([g["pos"] for g in gates])
+        try:
+            gate_pos_randomization = dict(config.env.randomizations.gate_pos.kwargs)
+        except (AttributeError, KeyError):
+            pass  # No randomization for this level (e.g., level0)
+        print(f"[gate_aware] {len(gates)} gates loaded, randomization={'yes' if gate_pos_randomization else 'no'}")
+        print(f"[gate_aware] Gate positions: {gate_positions.tolist()}")
+
     env = RandTrajEnv(
         n_samples=10,
         num_envs=num_envs,
@@ -483,6 +538,8 @@ def make_envs(
         physics=config.sim.physics,
         disturbances=config.env.disturbances,
         device=jax_device,
+        gate_positions=gate_positions,
+        gate_pos_randomization=gate_pos_randomization,
     )
 
     env = NormalizeActions(env)
