@@ -204,11 +204,15 @@ class RaceRewardAndObs(VectorEnv):
         # --- Crash penalty ---
         crash_penalty = terminated.astype(jp.float32)
 
-        # --- Out-of-bounds altitude penalty ---
+        # --- Out-of-bounds altitude penalty + hard termination ---
         z = drone_pos[:, 2]
+        oob_violation = (z > self.z_high) | (z < self.z_low)
         oob_penalty = self.oob_coef * (
             jp.maximum(z - self.z_high, 0.0) + jp.maximum(self.z_low - z, 0.0)
         )
+        # Hard-terminate OOB drones (overrides grace period)
+        if self.oob_coef > 0:
+            terminated = terminated | oob_violation
 
         # Only give proximity/speed reward to active (non-crashed) drones
         active = (target_gate >= 0).astype(jp.float32)
