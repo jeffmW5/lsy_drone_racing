@@ -104,6 +104,9 @@ class RaceRewardAndObs(VectorEnv):
         proximity_coef: float = 2.0,
         speed_coef: float = 0.1,
         rpy_coef: float = 0.06,
+        oob_coef: float = 0.0,
+        z_low: float = 0.0,
+        z_high: float = 2.0,
     ):
         self.env = env
         self.num_envs = env.num_envs
@@ -115,6 +118,9 @@ class RaceRewardAndObs(VectorEnv):
         self.proximity_coef = proximity_coef
         self.speed_coef = speed_coef
         self.rpy_coef = rpy_coef
+        self.oob_coef = oob_coef
+        self.z_low = z_low
+        self.z_high = z_high
 
         # Define the preprocessed observation space
         obs_spec = {
@@ -198,6 +204,12 @@ class RaceRewardAndObs(VectorEnv):
         # --- Crash penalty ---
         crash_penalty = terminated.astype(jp.float32)
 
+        # --- Out-of-bounds altitude penalty ---
+        z = drone_pos[:, 2]
+        oob_penalty = self.oob_coef * (
+            jp.maximum(z - self.z_high, 0.0) + jp.maximum(self.z_low - z, 0.0)
+        )
+
         # Only give proximity/speed reward to active (non-crashed) drones
         active = (target_gate >= 0).astype(jp.float32)
         reward = (
@@ -205,6 +217,7 @@ class RaceRewardAndObs(VectorEnv):
             + gate_reward
             - crash_penalty
             - rpy_penalty
+            - oob_penalty
         )
 
         self._prev_target_gate = jp.array(target_gate)
@@ -306,6 +319,9 @@ def make_race_envs(
         proximity_coef=coefs.get("proximity_coef", 2.0),
         speed_coef=coefs.get("speed_coef", 0.1),
         rpy_coef=coefs.get("rpy_coef", 0.06),
+        oob_coef=coefs.get("oob_coef", 0.0),
+        z_low=coefs.get("z_low", 0.0),
+        z_high=coefs.get("z_high", 2.0),
     )
     env = RaceStackObs(env, n_obs=coefs.get("n_obs", 2))
     env = ActionPenalty(
