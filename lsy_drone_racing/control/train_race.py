@@ -20,6 +20,7 @@ from gymnasium.vector import VectorEnv, VectorObservationWrapper
 from gymnasium.vector.utils import batch_space
 from gymnasium.wrappers.vector.jax_to_torch import JaxToTorch
 from jax.scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as ScipyR
 
 from lsy_drone_racing.control.train_rl import ActionPenalty, FlattenJaxObservation
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
@@ -111,6 +112,10 @@ class RaceRewardAndObs(VectorEnv):
         survive_coef: float = 0.0,
         vz_coef: float = 0.0,
         vz_threshold: float = 0.5,
+        random_gate_start: bool = False,
+        spawn_offset: float = 0.75,
+        spawn_pos_noise: float = 0.15,
+        spawn_vel_noise: float = 0.3,
     ):
         self.env = env
         self.num_envs = env.num_envs
@@ -129,6 +134,11 @@ class RaceRewardAndObs(VectorEnv):
         self.survive_coef = survive_coef
         self.vz_coef = vz_coef
         self.vz_threshold = vz_threshold
+        self.random_gate_start = random_gate_start
+        self.spawn_offset = spawn_offset
+        self.spawn_pos_noise = spawn_pos_noise
+        self.spawn_vel_noise = spawn_vel_noise
+        self._rng = np.random.default_rng()
 
         # Define the preprocessed observation space
         obs_spec = {
@@ -145,6 +155,7 @@ class RaceRewardAndObs(VectorEnv):
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
         self._prev_target_gate = None
+        self._was_done = None  # Track terminated|truncated for autoreset detection
 
     def _preprocess_obs(self, obs: dict) -> dict:
         """Convert RaceCoreEnv dict obs to relative-position obs."""
@@ -176,11 +187,25 @@ class RaceRewardAndObs(VectorEnv):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
+        if self.random_gate_start:
+            obs = self._apply_random_gate_start(obs)
         self._prev_target_gate = jp.array(obs["target_gate"])
+        self._was_done = None
         return self._preprocess_obs(obs), info
 
     def step(self, action):
         obs, _base_reward, terminated, truncated, info = self.env.step(action)
+
+        # Apply random gate start to autoreset envs
+        if self.random_gate_start and self._was_done is not None:
+            autoreset_mask = np.array(self._was_done)
+            if autoreset_mask.any():
+                obs = self._apply_random_gate_start(obs, mask=autoreset_mask)
+                # Sync _prev_target_gate to prevent false gate bonuses
+                new_target = jp.array(obs["target_gate"])
+                self._prev_target_gate = jp.where(
+                    jp.array(autoreset_mask), new_target, self._prev_target_gate
+                )
 
         target_gate = obs["target_gate"]  # (n_envs,)
         gates_pos = obs["gates_pos"]  # (n_envs, n_gates, 3)
@@ -246,8 +271,103 @@ class RaceRewardAndObs(VectorEnv):
         )
 
         self._prev_target_gate = jp.array(target_gate)
+        self._was_done = np.array(terminated | truncated)
 
         return self._preprocess_obs(obs), reward, terminated, truncated, info
+
+    def _apply_random_gate_start(self, obs: dict, mask: np.ndarray | None = None) -> dict:
+        """Override drone spawn to random gate positions.
+
+        After a normal reset, moves drones to a random position before a random gate,
+        facing toward it, with small perturbation in position/velocity/orientation.
+
+        Args:
+            obs: Observation dict from VecDroneRaceEnv (with drone dim squeezed).
+            mask: Boolean array (n_envs,) — only modify envs where True.
+                  If None, modify all envs.
+        """
+        if mask is None:
+            mask = np.ones(self.num_envs, dtype=bool)
+        n_reset = int(mask.sum())
+        if n_reset == 0:
+            return obs
+
+        # Pick random gates for reset envs
+        spawn_gates_full = np.array(obs["target_gate"], dtype=int)
+        spawn_gates_full[mask] = self._rng.integers(0, self.n_gates, size=n_reset)
+
+        gates_pos = np.array(obs["gates_pos"])  # (n_envs, n_gates, 3)
+        gates_quat = np.array(obs["gates_quat"])  # (n_envs, n_gates, 4) scipy order
+
+        idx = np.arange(self.num_envs)
+        target_pos = gates_pos[idx, spawn_gates_full]  # (n_envs, 3)
+        target_quat = gates_quat[idx, spawn_gates_full]  # (n_envs, 4)
+
+        # Gate forward = local x-axis (gates are crossed -x → +x)
+        gate_rot = ScipyR.from_quat(target_quat)
+        forward = gate_rot.apply(np.array([1.0, 0.0, 0.0]))  # (n_envs, 3)
+
+        # Spawn position: offset before gate + noise
+        spawn_pos = target_pos - self.spawn_offset * forward
+        pos_noise = self._rng.uniform(
+            -self.spawn_pos_noise, self.spawn_pos_noise, size=(self.num_envs, 3)
+        )
+        spawn_pos += pos_noise
+
+        # Drone orientation: face the gate (match gate yaw) + perturbation
+        gate_euler = gate_rot.as_euler("xyz")  # (n_envs, 3)
+        drone_rpy = np.zeros((self.num_envs, 3), dtype=np.float64)
+        drone_rpy[:, 2] = gate_euler[:, 2]  # Match gate yaw
+        drone_rpy[:, 0] += self._rng.uniform(-np.radians(5), np.radians(5), size=self.num_envs)
+        drone_rpy[:, 1] += self._rng.uniform(-np.radians(5), np.radians(5), size=self.num_envs)
+        drone_rpy[:, 2] += self._rng.uniform(-np.radians(15), np.radians(15), size=self.num_envs)
+        drone_quat = ScipyR.from_euler("xyz", drone_rpy).as_quat()  # (n_envs, 4)
+
+        # Spawn velocity: small random
+        spawn_vel = self._rng.uniform(
+            -self.spawn_vel_noise, self.spawn_vel_noise, size=(self.num_envs, 3)
+        )
+
+        # Merge with existing state for non-masked envs
+        core_env = self.env.unwrapped
+        old_pos = np.array(core_env.sim.data.states.pos[:, 0])
+        old_quat = np.array(core_env.sim.data.states.quat[:, 0])
+        old_vel = np.array(core_env.sim.data.states.vel[:, 0])
+
+        new_pos = np.where(mask[:, None], spawn_pos, old_pos).astype(np.float32)
+        new_quat = np.where(mask[:, None], drone_quat, old_quat).astype(np.float32)
+        new_vel = np.where(mask[:, None], spawn_vel, old_vel).astype(np.float32)
+
+        # Override sim state
+        pos = core_env.sim.data.states.pos.at[:, 0, :].set(new_pos)
+        quat = core_env.sim.data.states.quat.at[:, 0, :].set(new_quat)
+        vel = core_env.sim.data.states.vel.at[:, 0, :].set(new_vel)
+        ang_vel = core_env.sim.data.states.ang_vel.at[:, 0, :].set(
+            np.zeros((self.num_envs, 3), dtype=np.float32)
+        )
+        core_env.sim.data = core_env.sim.data.replace(
+            states=core_env.sim.data.states.replace(
+                pos=pos, quat=quat, vel=vel, ang_vel=ang_vel
+            )
+        )
+
+        # Override target gate and last_drone_pos
+        old_target = np.array(core_env.data.target_gate[:, 0])
+        new_target = np.where(mask, spawn_gates_full, old_target).astype(int)
+        core_env.data = core_env.data.replace(
+            target_gate=jp.array(new_target[:, None]),
+            last_drone_pos=pos,
+        )
+
+        # Update obs dict with new state
+        obs = dict(obs)  # shallow copy to avoid mutating caller's dict
+        obs["pos"] = core_env.sim.data.states.pos[:, 0]
+        obs["quat"] = core_env.sim.data.states.quat[:, 0]
+        obs["vel"] = core_env.sim.data.states.vel[:, 0]
+        obs["ang_vel"] = core_env.sim.data.states.ang_vel[:, 0]
+        obs["target_gate"] = core_env.data.target_gate[:, 0]
+
+        return obs
 
     def close(self):
         return self.env.close()
@@ -351,6 +471,10 @@ def make_race_envs(
         survive_coef=coefs.get("survive_coef", 0.0),
         vz_coef=coefs.get("vz_coef", 0.0),
         vz_threshold=coefs.get("vz_threshold", 0.5),
+        random_gate_start=coefs.get("random_gate_start", False),
+        spawn_offset=coefs.get("spawn_offset", 0.75),
+        spawn_pos_noise=coefs.get("spawn_pos_noise", 0.15),
+        spawn_vel_noise=coefs.get("spawn_vel_noise", 0.3),
     )
     env = RaceStackObs(env, n_obs=coefs.get("n_obs", 2))
     env = ActionPenalty(
