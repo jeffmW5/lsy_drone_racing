@@ -114,6 +114,7 @@ class RaceRewardAndObs(VectorEnv):
         vz_threshold: float = 0.5,
         random_gate_start: bool = False,
         random_gate_ratio: float = 1.0,
+        progress_coef: float = 0.0,
         spawn_offset: float = 0.75,
         spawn_pos_noise: float = 0.15,
         spawn_vel_noise: float = 0.3,
@@ -157,6 +158,8 @@ class RaceRewardAndObs(VectorEnv):
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
         self._prev_target_gate = None
+        self._prev_dist = None
+        self.progress_coef = progress_coef
         self._was_done = None  # Track terminated|truncated for autoreset detection
 
     def _preprocess_obs(self, obs: dict) -> dict:
@@ -193,6 +196,12 @@ class RaceRewardAndObs(VectorEnv):
             obs = self._apply_random_gate_start(obs)
         self._prev_target_gate = jp.array(obs["target_gate"])
         self._was_done = None
+        # Initialize prev_dist for delta-progress reward
+        if self.progress_coef > 0.0:
+            safe_t = jp.clip(jp.array(obs["target_gate"]), 0, self.n_gates - 1)
+            idx0 = jp.arange(self.num_envs)
+            t_pos = jp.array(obs["gates_pos"])[idx0, safe_t]
+            self._prev_dist = jp.linalg.norm(t_pos - jp.array(obs["pos"]), axis=-1)
         return self._preprocess_obs(obs), info
 
     def step(self, action):
@@ -221,7 +230,12 @@ class RaceRewardAndObs(VectorEnv):
         target_pos = gates_pos[idx, safe_target]
         rel_pos = target_pos - drone_pos
         dist = jp.linalg.norm(rel_pos, axis=-1)
-        proximity = jp.exp(-self.proximity_coef * dist)
+        if self.progress_coef > 0.0 and self._prev_dist is not None:
+            # Potential-based reward shaping: F = gamma*Phi(s') - Phi(s), Phi(s) = -dist
+            # Only reward positive progress (approaching gate), not retreating
+            proximity = self.progress_coef * jp.maximum(self._prev_dist - dist, 0.0)
+        else:
+            proximity = jp.exp(-self.proximity_coef * dist)
 
         # --- Speed toward gate ---
         direction = rel_pos / (dist[:, None] + 1e-6)
@@ -273,6 +287,8 @@ class RaceRewardAndObs(VectorEnv):
         )
 
         self._prev_target_gate = jp.array(target_gate)
+        if self.progress_coef > 0.0:
+            self._prev_dist = dist
         self._was_done = np.array(terminated | truncated)
 
         return self._preprocess_obs(obs), reward, terminated, truncated, info
@@ -479,6 +495,7 @@ def make_race_envs(
         vz_threshold=coefs.get("vz_threshold", 0.5),
         random_gate_start=coefs.get("random_gate_start", False),
         random_gate_ratio=coefs.get("random_gate_ratio", 1.0),
+        progress_coef=coefs.get("progress_coef", 0.0),
         spawn_offset=coefs.get("spawn_offset", 0.75),
         spawn_pos_noise=coefs.get("spawn_pos_noise", 0.15),
         spawn_vel_noise=coefs.get("spawn_vel_noise", 0.3),
