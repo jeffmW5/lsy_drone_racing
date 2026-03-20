@@ -113,6 +113,7 @@ class RaceRewardAndObs(VectorEnv):
         vz_coef: float = 0.0,
         vz_threshold: float = 0.5,
         random_gate_start: bool = False,
+        random_gate_ratio: float = 1.0,
         spawn_offset: float = 0.75,
         spawn_pos_noise: float = 0.15,
         spawn_vel_noise: float = 0.3,
@@ -135,6 +136,7 @@ class RaceRewardAndObs(VectorEnv):
         self.vz_coef = vz_coef
         self.vz_threshold = vz_threshold
         self.random_gate_start = random_gate_start
+        self.random_gate_ratio = random_gate_ratio  # fraction of envs that get random gate start
         self.spawn_offset = spawn_offset
         self.spawn_pos_noise = spawn_pos_noise
         self.spawn_vel_noise = spawn_vel_noise
@@ -284,10 +286,14 @@ class RaceRewardAndObs(VectorEnv):
         Args:
             obs: Observation dict from VecDroneRaceEnv (with drone dim squeezed).
             mask: Boolean array (n_envs,) — only modify envs where True.
-                  If None, modify all envs.
+                  If None, apply to random_gate_ratio fraction of envs.
         """
         if mask is None:
-            mask = np.ones(self.num_envs, dtype=bool)
+            # Initial reset: apply to random_gate_ratio fraction
+            mask = self._rng.random(self.num_envs) < self.random_gate_ratio
+        else:
+            # Autoreset: apply ratio within the autoreset mask
+            mask = mask & (self._rng.random(self.num_envs) < self.random_gate_ratio)
         n_reset = int(mask.sum())
         if n_reset == 0:
             return obs
@@ -472,6 +478,7 @@ def make_race_envs(
         vz_coef=coefs.get("vz_coef", 0.0),
         vz_threshold=coefs.get("vz_threshold", 0.5),
         random_gate_start=coefs.get("random_gate_start", False),
+        random_gate_ratio=coefs.get("random_gate_ratio", 1.0),
         spawn_offset=coefs.get("spawn_offset", 0.75),
         spawn_pos_noise=coefs.get("spawn_pos_noise", 0.15),
         spawn_vel_noise=coefs.get("spawn_vel_noise", 0.3),
