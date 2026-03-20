@@ -109,6 +109,8 @@ class RaceRewardAndObs(VectorEnv):
         z_high: float = 2.0,
         alt_coef: float = 0.0,
         survive_coef: float = 0.0,
+        vz_coef: float = 0.0,
+        vz_threshold: float = 0.5,
     ):
         self.env = env
         self.num_envs = env.num_envs
@@ -125,6 +127,8 @@ class RaceRewardAndObs(VectorEnv):
         self.z_high = z_high
         self.alt_coef = alt_coef
         self.survive_coef = survive_coef
+        self.vz_coef = vz_coef
+        self.vz_threshold = vz_threshold
 
         # Define the preprocessed observation space
         obs_spec = {
@@ -226,6 +230,10 @@ class RaceRewardAndObs(VectorEnv):
         # --- Survival bonus: reward for staying alive ---
         survive_reward = self.survive_coef
 
+        # --- Vertical velocity penalty: penalize upward velocity when above threshold ---
+        vz = drone_vel[:, 2]
+        vz_penalty = self.vz_coef * jp.maximum(vz, 0.0) * (z > self.vz_threshold).astype(jp.float32)
+
         # Only give proximity/speed/alt reward to active (non-crashed) drones
         active = (target_gate >= 0).astype(jp.float32)
         reward = (
@@ -234,6 +242,7 @@ class RaceRewardAndObs(VectorEnv):
             - crash_penalty
             - rpy_penalty
             - oob_penalty
+            - vz_penalty
         )
 
         self._prev_target_gate = jp.array(target_gate)
@@ -340,6 +349,8 @@ def make_race_envs(
         z_high=coefs.get("z_high", 2.0),
         alt_coef=coefs.get("alt_coef", 0.0),
         survive_coef=coefs.get("survive_coef", 0.0),
+        vz_coef=coefs.get("vz_coef", 0.0),
+        vz_threshold=coefs.get("vz_threshold", 0.5),
     )
     env = RaceStackObs(env, n_obs=coefs.get("n_obs", 2))
     env = ActionPenalty(
