@@ -115,6 +115,8 @@ class RaceRewardAndObs(VectorEnv):
         random_gate_start: bool = False,
         random_gate_ratio: float = 1.0,
         progress_coef: float = 0.0,
+        gate_in_view_coef: float = 0.0,
+        reward_mode: str = "add",  # "add" or "multiply" (view * progress)
         spawn_offset: float = 0.75,
         spawn_pos_noise: float = 0.15,
         spawn_vel_noise: float = 0.3,
@@ -160,6 +162,8 @@ class RaceRewardAndObs(VectorEnv):
         self._prev_target_gate = None
         self._prev_dist = None
         self.progress_coef = progress_coef
+        self.gate_in_view_coef = gate_in_view_coef
+        self.reward_mode = reward_mode
         self._was_done = None  # Track terminated|truncated for autoreset detection
 
     def _preprocess_obs(self, obs: dict) -> dict:
@@ -196,12 +200,13 @@ class RaceRewardAndObs(VectorEnv):
             obs = self._apply_random_gate_start(obs)
         self._prev_target_gate = jp.array(obs["target_gate"])
         self._was_done = None
-        # Initialize prev_dist for delta-progress reward
+        # Initialize prev_dist for delta-progress reward (XY only — ignore altitude)
         if self.progress_coef > 0.0:
             safe_t = jp.clip(jp.array(obs["target_gate"]), 0, self.n_gates - 1)
             idx0 = jp.arange(self.num_envs)
             t_pos = jp.array(obs["gates_pos"])[idx0, safe_t]
-            self._prev_dist = jp.linalg.norm(t_pos - jp.array(obs["pos"]), axis=-1)
+            rel = t_pos - jp.array(obs["pos"])
+            self._prev_dist = jp.linalg.norm(rel[:, :2], axis=-1)
         return self._preprocess_obs(obs), info
 
     def step(self, action):
@@ -230,10 +235,11 @@ class RaceRewardAndObs(VectorEnv):
         target_pos = gates_pos[idx, safe_target]
         rel_pos = target_pos - drone_pos
         dist = jp.linalg.norm(rel_pos, axis=-1)
+        # XY-only distance for progress reward — prevents gaming by falling
+        dist_xy = jp.linalg.norm(rel_pos[:, :2], axis=-1)
         if self.progress_coef > 0.0 and self._prev_dist is not None:
-            # Potential-based reward shaping: F = gamma*Phi(s') - Phi(s), Phi(s) = -dist
-            # Only reward positive progress (approaching gate), not retreating
-            proximity = self.progress_coef * jp.maximum(self._prev_dist - dist, 0.0)
+            # Potential-based reward shaping using horizontal distance only
+            proximity = self.progress_coef * jp.maximum(self._prev_dist - dist_xy, 0.0)
         else:
             proximity = jp.exp(-self.proximity_coef * dist)
 
@@ -275,10 +281,25 @@ class RaceRewardAndObs(VectorEnv):
         vz = drone_vel[:, 2]
         vz_penalty = self.vz_coef * jp.maximum(vz, 0.0) * (z > self.vz_threshold).astype(jp.float32)
 
+        # --- Gate-in-view reward: alignment of drone forward axis with direction to gate ---
+        if self.gate_in_view_coef > 0.0:
+            rot_mat = R.from_quat(drone_quat).as_matrix()  # (n_envs, 3, 3)
+            drone_forward = rot_mat[:, :, 0]  # body x-axis in world frame
+            gate_dir = rel_pos / (dist[:, None] + 1e-6)
+            alignment = jp.sum(drone_forward * gate_dir, axis=-1)  # cosine [-1, 1]
+            view_reward = self.gate_in_view_coef * jp.maximum(alignment, 0.0)
+        else:
+            view_reward = 0.0
+
         # Only give proximity/speed/alt reward to active (non-crashed) drones
         active = (target_gate >= 0).astype(jp.float32)
+        if self.reward_mode == "multiply" and self.gate_in_view_coef > 0.0:
+            # view * progress: zero reward unless both facing AND moving
+            reward = active * (view_reward * proximity + speed_reward + alt_reward + survive_reward)
+        else:
+            reward = active * (proximity + speed_reward + alt_reward + survive_reward + view_reward)
         reward = (
-            active * (proximity + speed_reward + alt_reward + survive_reward)
+            reward
             + gate_reward
             - crash_penalty
             - rpy_penalty
@@ -288,7 +309,7 @@ class RaceRewardAndObs(VectorEnv):
 
         self._prev_target_gate = jp.array(target_gate)
         if self.progress_coef > 0.0:
-            self._prev_dist = dist
+            self._prev_dist = dist_xy
         self._was_done = np.array(terminated | truncated)
 
         return self._preprocess_obs(obs), reward, terminated, truncated, info
@@ -496,6 +517,8 @@ def make_race_envs(
         random_gate_start=coefs.get("random_gate_start", False),
         random_gate_ratio=coefs.get("random_gate_ratio", 1.0),
         progress_coef=coefs.get("progress_coef", 0.0),
+        gate_in_view_coef=coefs.get("gate_in_view_coef", 0.0),
+        reward_mode=coefs.get("reward_mode", "add"),
         spawn_offset=coefs.get("spawn_offset", 0.75),
         spawn_pos_noise=coefs.get("spawn_pos_noise", 0.15),
         spawn_vel_noise=coefs.get("spawn_vel_noise", 0.3),

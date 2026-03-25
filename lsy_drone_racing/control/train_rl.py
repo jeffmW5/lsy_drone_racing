@@ -88,6 +88,8 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+    max_logstd: float = None
+    """clamp actor_logstd to this max value (None = no clamp)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -599,6 +601,8 @@ class Agent(nn.Module):
         """Action output."""
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
+        if hasattr(self, "max_logstd"):
+            action_logstd = torch.clamp(action_logstd, max=self.max_logstd)
         action_std = torch.exp(action_logstd)
         # During learning the agent explores the environment by sampling actions from a Normal
         # distribution. The standard deviation is a learnable parameter that should decrease during
@@ -640,6 +644,8 @@ def train_ppo(
     )
 
     agent = Agent(envs.single_observation_space.shape, envs.single_action_space.shape).to(device)
+    if args.max_logstd is not None:
+        agent.max_logstd = args.max_logstd
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
