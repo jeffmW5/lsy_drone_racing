@@ -121,6 +121,11 @@ class RaceRewardAndObs(VectorEnv):
         spawn_pos_noise: float = 0.15,
         spawn_vel_noise: float = 0.3,
         bilateral_progress: bool = False,
+        body_frame_obs: bool = False,
+        soft_collision: bool = False,
+        soft_collision_penalty: float = 5.0,
+        soft_collision_steps: int = 5_000_000,
+        asymmetric_critic: bool = False,
     ):
         self.env = env
         self.num_envs = env.num_envs
@@ -145,19 +150,38 @@ class RaceRewardAndObs(VectorEnv):
         self.spawn_pos_noise = spawn_pos_noise
         self.spawn_vel_noise = spawn_vel_noise
         self.bilateral_progress = bilateral_progress
+        self.body_frame_obs = body_frame_obs
+        self.soft_collision = soft_collision
+        self.soft_collision_penalty = soft_collision_penalty
+        self.soft_collision_steps = soft_collision_steps
+        self.asymmetric_critic = asymmetric_critic
+        self._total_steps = 0
+        self._last_privileged = None
         self._rng = np.random.default_rng()
 
         # Define the preprocessed observation space
-        obs_spec = {
-            "pos": spaces.Box(-np.inf, np.inf, shape=(3,)),
-            "quat": spaces.Box(-1, 1, shape=(4,)),
-            "vel": spaces.Box(-np.inf, np.inf, shape=(3,)),
-            "ang_vel": spaces.Box(-np.inf, np.inf, shape=(3,)),
-            "rel_target_gate": spaces.Box(-np.inf, np.inf, shape=(3,)),
-            "target_gate_quat": spaces.Box(-1, 1, shape=(4,)),
-            "rel_next_gate": spaces.Box(-np.inf, np.inf, shape=(3,)),
-            "next_gate_quat": spaces.Box(-1, 1, shape=(4,)),
-        }
+        if self.body_frame_obs:
+            obs_spec = {
+                "pos": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "quat": spaces.Box(-1, 1, shape=(4,)),
+                "vel": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "ang_vel": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "rel_target_body": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "target_normal_body": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "rel_next_body": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "next_normal_body": spaces.Box(-np.inf, np.inf, shape=(3,)),
+            }
+        else:
+            obs_spec = {
+                "pos": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "quat": spaces.Box(-1, 1, shape=(4,)),
+                "vel": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "ang_vel": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "rel_target_gate": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "target_gate_quat": spaces.Box(-1, 1, shape=(4,)),
+                "rel_next_gate": spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "next_gate_quat": spaces.Box(-1, 1, shape=(4,)),
+            }
         self.single_observation_space = spaces.Dict(obs_spec)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
@@ -171,6 +195,7 @@ class RaceRewardAndObs(VectorEnv):
     def _preprocess_obs(self, obs: dict) -> dict:
         """Convert RaceCoreEnv dict obs to relative-position obs."""
         drone_pos = obs["pos"]  # (n_envs, 3)
+        drone_quat = obs["quat"]  # (n_envs, 4)
         target_gate = obs["target_gate"]  # (n_envs,)
         gates_pos = obs["gates_pos"]  # (n_envs, n_gates, 3)
         gates_quat = obs["gates_quat"]  # (n_envs, n_gates, 4)
@@ -184,6 +209,37 @@ class RaceRewardAndObs(VectorEnv):
         target_quat = gates_quat[idx, safe_target]
         next_pos = gates_pos[idx, next_target]
         next_quat = gates_quat[idx, next_target]
+
+        # Store privileged obs for asymmetric critic (all gate positions + quats)
+        if self.asymmetric_critic:
+            self._last_privileged = jp.concatenate([
+                gates_pos.reshape(self.num_envs, -1),   # (n_envs, n_gates*3)
+                gates_quat.reshape(self.num_envs, -1),  # (n_envs, n_gates*4)
+            ], axis=-1)
+
+        if self.body_frame_obs:
+            # Transform gate info to drone body frame
+            drone_rot_inv = R.from_quat(drone_quat).inv()
+            rel_target = target_pos - drone_pos
+            rel_next = next_pos - drone_pos
+            rel_target_body = drone_rot_inv.apply(rel_target)
+            rel_next_body = drone_rot_inv.apply(rel_next)
+            # Gate normals: x-axis of gate rotation, transformed to body frame
+            unit_x = jp.broadcast_to(jp.array([1.0, 0.0, 0.0]), drone_pos.shape)
+            target_fwd = R.from_quat(target_quat).apply(unit_x)
+            next_fwd = R.from_quat(next_quat).apply(unit_x)
+            target_normal_body = drone_rot_inv.apply(target_fwd)
+            next_normal_body = drone_rot_inv.apply(next_fwd)
+            return {
+                "pos": obs["pos"],
+                "quat": obs["quat"],
+                "vel": obs["vel"],
+                "ang_vel": obs["ang_vel"],
+                "rel_target_body": rel_target_body,
+                "target_normal_body": target_normal_body,
+                "rel_next_body": rel_next_body,
+                "next_normal_body": next_normal_body,
+            }
 
         return {
             "pos": obs["pos"],
@@ -213,6 +269,10 @@ class RaceRewardAndObs(VectorEnv):
 
     def step(self, action):
         obs, _base_reward, terminated, truncated, info = self.env.step(action)
+        self._total_steps += self.num_envs
+
+        # Save real termination for autoreset tracking (before soft-collision suppression)
+        real_terminated = terminated
 
         # Apply random gate start to autoreset envs
         if self.random_gate_start and self._was_done is not None:
@@ -224,6 +284,14 @@ class RaceRewardAndObs(VectorEnv):
                 self._prev_target_gate = jp.where(
                     jp.array(autoreset_mask), new_target, self._prev_target_gate
                 )
+                # Sync _prev_dist for respawned envs (prevents spurious progress delta)
+                if self.progress_coef > 0.0 and self._prev_dist is not None:
+                    safe_t2 = jp.clip(new_target, 0, self.n_gates - 1)
+                    t_pos2 = jp.array(obs["gates_pos"])[jp.arange(self.num_envs), safe_t2]
+                    new_dist = jp.linalg.norm((t_pos2 - jp.array(obs["pos"]))[:, :2], axis=-1)
+                    self._prev_dist = jp.where(
+                        jp.array(autoreset_mask), new_dist, self._prev_dist
+                    )
 
         target_gate = obs["target_gate"]  # (n_envs,)
         gates_pos = obs["gates_pos"]  # (n_envs, n_gates, 3)
@@ -313,10 +381,25 @@ class RaceRewardAndObs(VectorEnv):
             - vz_penalty
         )
 
+        # === SOFT COLLISION: suppress termination during phase 1 ===
+        if self.soft_collision and self._total_steps < self.soft_collision_steps:
+            soft_crashed = np.array(real_terminated) & ~np.array(truncated)
+            if np.any(soft_crashed):
+                sc = jp.array(soft_crashed)
+                # Override reward for soft-crashed envs (replace all components with flat penalty)
+                reward = jp.where(sc, jp.float32(-self.soft_collision_penalty), reward)
+                # Suppress termination signal — PPO sees episode continuing
+                terminated = jp.where(sc, False, terminated)
+            # Log phase transition
+            if (self._total_steps - self.num_envs < self.soft_collision_steps
+                    <= self._total_steps):
+                print(f"[SOFT COLLISION] Phase 2 at step {self._total_steps}: "
+                      f"hard termination on crash")
+
         self._prev_target_gate = jp.array(target_gate)
         if self.progress_coef > 0.0:
             self._prev_dist = dist_xy
-        self._was_done = np.array(terminated | truncated)
+        self._was_done = np.array(real_terminated | truncated)
 
         return self._preprocess_obs(obs), reward, terminated, truncated, info
 
@@ -460,6 +543,58 @@ class RaceStackObs(VectorObservationWrapper):
         return jp.concatenate([prev_obs[:, 1:, :], basic_obs[:, None, :]], axis=1)
 
 
+class AppendPrivilegedObs(VectorEnv):
+    """Append privileged observations for asymmetric actor-critic (exp_059).
+
+    Adds all gate positions and quaternions to the observation dict so the critic
+    can see the full track layout. Placed after ActionPenalty so privileged dims
+    are at the END of the flat vector. Actor uses x[:, :actor_obs_dim], critic
+    uses full x.
+    """
+
+    def __init__(self, env: VectorEnv, reward_wrapper: RaceRewardAndObs):
+        self.env = env
+        self.num_envs = env.num_envs
+        self.single_action_space = env.single_action_space
+        self.action_space = env.action_space
+        self._reward_wrapper = reward_wrapper
+
+        # Compute actor obs dim (flat dim of all keys before privileged)
+        self.actor_obs_dim = sum(
+            int(np.prod(v.shape)) for v in env.single_observation_space.values()
+        )
+
+        # Add privileged obs to observation space
+        n_gates = reward_wrapper.n_gates
+        self._priv_dim = n_gates * 3 + n_gates * 4  # positions + quaternions
+        spec = dict(env.single_observation_space.items())
+        spec["privileged_obs"] = spaces.Box(-np.inf, np.inf, shape=(self._priv_dim,))
+        self.single_observation_space = spaces.Dict(spec)
+        self.observation_space = batch_space(self.single_observation_space, self.num_envs)
+
+    def _add_privileged(self, obs: dict) -> dict:
+        priv = self._reward_wrapper._last_privileged
+        if priv is None:
+            priv = jp.zeros((self.num_envs, self._priv_dim))
+        obs["privileged_obs"] = priv
+        return obs
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._add_privileged(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._add_privileged(obs), reward, terminated, truncated, info
+
+    def close(self):
+        return self.env.close()
+
+    @property
+    def unwrapped(self):
+        return self.env.unwrapped
+
+
 # =============================================================================
 # Environment Factory
 # =============================================================================
@@ -529,7 +664,14 @@ def make_race_envs(
         spawn_pos_noise=coefs.get("spawn_pos_noise", 0.15),
         spawn_vel_noise=coefs.get("spawn_vel_noise", 0.3),
         bilateral_progress=coefs.get("bilateral_progress", False),
+        body_frame_obs=coefs.get("body_frame_obs", False),
+        soft_collision=coefs.get("soft_collision", False),
+        soft_collision_penalty=coefs.get("soft_collision_penalty", 5.0),
+        soft_collision_steps=coefs.get("soft_collision_steps", 5_000_000),
+        asymmetric_critic=coefs.get("asymmetric_critic", False),
     )
+    reward_wrapper = env  # keep reference for AppendPrivilegedObs
+
     env = RaceStackObs(env, n_obs=coefs.get("n_obs", 2))
     env = ActionPenalty(
         env,
@@ -537,8 +679,19 @@ def make_race_envs(
         d_act_th_coef=coefs.get("d_act_th_coef", 0.4),
         d_act_xy_coef=coefs.get("d_act_xy_coef", 1.0),
     )
+
+    # Asymmetric critic: append privileged obs (all gate positions/quats) at end
+    if coefs.get("asymmetric_critic", False):
+        env = AppendPrivilegedObs(env, reward_wrapper)
+        print(f"[make_race_envs] asymmetric_critic: privileged_dim={n_gates * 7}, "
+              f"actor_obs_dim={env.actor_obs_dim}")
+
     env = FlattenJaxObservation(env)
     env = JaxToTorch(env, torch_device)
+
+    # Propagate actor_obs_dim to the final env for train_racing.py to read
+    if coefs.get("asymmetric_critic", False):
+        env.actor_obs_dim = int(np.prod(env.single_observation_space.shape)) - n_gates * 7
 
     print(f"[make_race_envs] obs_space={env.single_observation_space}, "
           f"act_space={env.single_action_space}")

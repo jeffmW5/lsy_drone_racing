@@ -50,10 +50,16 @@ class AttitudeRL(Controller):
 
         self.n_obs = 2
         self.n_gates = len(config.env.track.gates)
+        self.body_frame_obs = os.environ.get("DRONE_RL_BODY_FRAME_OBS", "").lower() == "true"
 
-        # Obs dims: pos(3) + quat(4) + vel(3) + ang_vel(3) + rel_target(3) +
-        #           target_quat(4) + rel_next(3) + next_quat(4) + prev_obs(26) + last_action(4)
-        obs_dim = 13 + 3 + 4 + 3 + 4 + 13 * self.n_obs + 4  # = 57
+        if self.body_frame_obs:
+            # Body-frame obs: pos(3)+quat(4)+vel(3)+ang_vel(3) + rel_body(3)+normal_body(3)×2
+            #                 + prev_obs(26) + last_action(4) = 55
+            obs_dim = 13 + 3 + 3 + 3 + 3 + 13 * self.n_obs + 4  # = 55
+        else:
+            # World-frame obs: pos(3)+quat(4)+vel(3)+ang_vel(3) + rel(3)+quat(4)×2
+            #                  + prev_obs(26) + last_action(4) = 57
+            obs_dim = 13 + 3 + 4 + 3 + 4 + 13 * self.n_obs + 4  # = 57
 
         # Load RL policy
         model_path = os.environ.get("DRONE_RL_CKPT_PATH")
@@ -62,8 +68,18 @@ class AttitudeRL(Controller):
                 "DRONE_RL_CKPT_PATH environment variable not set. "
                 "Set it to the path of the model.ckpt file."
             )
-        self.agent = Agent((obs_dim,), (4,)).to("cpu")
-        self.agent.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+
+        # Load checkpoint — detect if asymmetric agent (has _actor_obs_dim buffer)
+        ckpt = torch.load(model_path, map_location=torch.device("cpu"))
+        if "_actor_obs_dim" in ckpt:
+            # Asymmetric agent: load only actor weights into standard Agent
+            self.agent = Agent((obs_dim,), (4,)).to("cpu")
+            actor_state = {k: v for k, v in ckpt.items()
+                          if k.startswith("actor") and not k.startswith("_")}
+            self.agent.load_state_dict(actor_state, strict=False)
+        else:
+            self.agent = Agent((obs_dim,), (4,)).to("cpu")
+            self.agent.load_state_dict(ckpt)
         self.agent.eval()
 
         # State tracking
@@ -153,18 +169,41 @@ class AttitudeRL(Controller):
         )  # (13,)
 
         # Build flat observation (same order as FlattenJaxObservation)
-        parts = [
-            obs["pos"],           # 3
-            obs["quat"],          # 4
-            obs["vel"],           # 3
-            obs["ang_vel"],       # 3
-            rel_target,           # 3
-            target_quat,          # 4
-            rel_next,             # 3
-            next_quat,            # 4
-            self.prev_obs.reshape(-1),  # 13 * n_obs
-            self.last_action,     # 4
-        ]
+        if self.body_frame_obs:
+            # Transform gate info to drone body frame
+            drone_rot_inv = Rotation.from_quat(obs["quat"]).inv()
+            rel_target_body = drone_rot_inv.apply(rel_target)
+            rel_next_body = drone_rot_inv.apply(rel_next)
+            # Gate normals: x-axis of gate rotation, in body frame
+            target_fwd = Rotation.from_quat(target_quat).apply([1.0, 0.0, 0.0])
+            next_fwd = Rotation.from_quat(next_quat).apply([1.0, 0.0, 0.0])
+            target_normal_body = drone_rot_inv.apply(target_fwd)
+            next_normal_body = drone_rot_inv.apply(next_fwd)
+            parts = [
+                obs["pos"],               # 3
+                obs["quat"],              # 4
+                obs["vel"],               # 3
+                obs["ang_vel"],           # 3
+                rel_target_body,          # 3
+                target_normal_body,       # 3
+                rel_next_body,            # 3
+                next_normal_body,         # 3
+                self.prev_obs.reshape(-1),  # 13 * n_obs
+                self.last_action,         # 4
+            ]
+        else:
+            parts = [
+                obs["pos"],           # 3
+                obs["quat"],          # 4
+                obs["vel"],           # 3
+                obs["ang_vel"],       # 3
+                rel_target,           # 3
+                target_quat,          # 4
+                rel_next,             # 3
+                next_quat,            # 4
+                self.prev_obs.reshape(-1),  # 13 * n_obs
+                self.last_action,     # 4
+            ]
         flat = np.concatenate(parts, axis=-1).astype(np.float32)
 
         # Update history buffer (shift and append current)

@@ -613,6 +613,62 @@ class Agent(nn.Module):
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
 
+class AsymmetricAgent(nn.Module):
+    """RL Agent with asymmetric actor-critic (exp_059).
+
+    The critic sees full observations including privileged info (all gate positions/quats).
+    The actor sees only the first actor_obs_dim dimensions (normal obs).
+    At inference, only the actor is used so privileged obs aren't needed.
+    """
+
+    def __init__(self, obs_shape: tuple, action_shape: tuple, actor_obs_dim: int):
+        """Init with separate input dims for actor and critic."""
+        super().__init__()
+        total_dim = int(torch.tensor(obs_shape).prod())
+        self.actor_obs_dim = actor_obs_dim
+        self.register_buffer("_actor_obs_dim", torch.tensor(actor_obs_dim))
+
+        # Critic sees full obs (normal + privileged)
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(total_dim, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 1), std=1.0),
+        )
+        # Actor sees only normal obs
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(actor_obs_dim, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, int(torch.tensor(action_shape).prod()), std=0.01)),
+            nn.Tanh(),
+        )
+        self.actor_logstd = nn.Parameter(
+            torch.Tensor([[-1, -1, -1, 1]])  # start with smaller std for roll, pitch, yaw
+        )
+
+    def get_value(self, x: Tensor) -> Tensor:
+        """Value estimation using full obs."""
+        return self.critic(x)
+
+    def get_action_and_value(
+        self, x: Tensor, action: Tensor | None = None, deterministic: bool = False
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Action from actor (normal obs), value from critic (full obs)."""
+        actor_x = x[:, :self.actor_obs_dim]
+        action_mean = self.actor_mean(actor_x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        if hasattr(self, "max_logstd"):
+            action_logstd = torch.clamp(action_logstd, max=self.max_logstd)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        if action is None:
+            action = probs.sample() if not deterministic else action_mean
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+
+
 # region Train
 def train_ppo(
     args: Args, model_path: Path, device: torch.device, jax_device: str, wandb_enabled: bool = False
