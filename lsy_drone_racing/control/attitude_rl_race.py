@@ -2,10 +2,17 @@
 
 Reads configuration from environment variables:
     DRONE_RL_CKPT_PATH  - path to model.ckpt (required)
+    DRONE_RL_TAKEOFF_ALT - altitude threshold to switch from takeoff to RL (default: 0.4)
+    DRONE_RL_TAKEOFF_STEPS - max steps for takeoff phase (default: 50)
 
 Unlike attitude_rl_generic.py, this controller does NOT build a trajectory.
 Instead, it preprocesses the obs dict the same way as training:
     drone state + relative gate positions → flat vector → agent forward pass
+
+Includes a takeoff phase: if the drone starts near ground level, the controller
+applies level hover thrust until reaching DRONE_RL_TAKEOFF_ALT, then switches
+to the RL policy. This bridges the domain gap between mid-air training spawns
+and ground-level benchmark starts.
 
 Usage:
     DRONE_RL_CKPT_PATH=/path/to/model.ckpt pixi run python scripts/sim.py \
@@ -65,15 +72,48 @@ class AttitudeRL(Controller):
         self.prev_obs = np.tile(basic_obs[None, :], (self.n_obs, 1))  # (n_obs, 13)
 
         self._finished = False
+        self._step = 0
+
+        # Takeoff phase: if starting near ground, apply hover thrust until reaching altitude
+        self._takeoff_alt = float(os.environ.get("DRONE_RL_TAKEOFF_ALT", "0.4"))
+        self._takeoff_max_steps = int(os.environ.get("DRONE_RL_TAKEOFF_STEPS", "50"))
+        # Compute hover thrust action: thrust = mass * g, then map to [-1, 1] action space
+        hover_thrust = self.drone_mass * 9.81
+        # Slightly above hover to climb
+        climb_thrust = hover_thrust * 1.5
+        # Map to [-1, 1]: action = (thrust - center) / scale
+        thrust_scale = (self.thrust_max - self.thrust_min) / 2.0
+        thrust_center = (self.thrust_max + self.thrust_min) / 2.0
+        self._takeoff_thrust_action = np.clip(
+            (climb_thrust - thrust_center) / thrust_scale, -1.0, 1.0
+        )
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
+        self._step += 1
+
+        # Takeoff phase: level hover with climb thrust until reaching altitude
+        drone_z = obs["pos"][2]
+        if self._step <= self._takeoff_max_steps and drone_z < self._takeoff_alt:
+            # Zero roll/pitch/yaw, climb thrust
+            raw_action = np.array([0.0, 0.0, 0.0, self._takeoff_thrust_action],
+                                  dtype=np.float32)
+            self.last_action = raw_action.copy()
+            # Still update obs history so RL policy gets smooth transition
+            self._preprocess_obs(obs)
+            raw_action[2] = 0.0
+            return self._scale_action(raw_action).astype(np.float32)
+
+        # RL policy phase
         obs_flat = self._preprocess_obs(obs)
         obs_tensor = torch.tensor(obs_flat, dtype=torch.float32).unsqueeze(0)
 
+        stochastic = os.environ.get("DRONE_RL_STOCHASTIC", "").lower() == "true"
         with torch.no_grad():
-            act, _, _, _ = self.agent.get_action_and_value(obs_tensor, deterministic=True)
+            act, _, _, _ = self.agent.get_action_and_value(
+                obs_tensor, deterministic=not stochastic
+            )
             raw_action = act.squeeze(0).numpy().copy()
 
         # Store raw action for obs preprocessing (before yaw zeroing)
@@ -155,9 +195,20 @@ class AttitudeRL(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
+        # Log trajectory for debugging
+        if os.environ.get("DRONE_RL_LOG_TRAJECTORY"):
+            pos = obs["pos"]
+            vel = obs["vel"]
+            gate_idx = int(obs.get("target_gate", 0))
+            if self._step % 5 == 0 or terminated:
+                status = "CRASH" if terminated else "fly"
+                print(f"  step={self._step:4d} pos=[{pos[0]:+.2f},{pos[1]:+.2f},{pos[2]:.2f}] "
+                      f"vel=[{vel[0]:+.2f},{vel[1]:+.2f},{vel[2]:+.2f}] "
+                      f"gate={gate_idx} {status}")
         return self._finished
 
     def episode_callback(self):
         self.prev_obs = np.zeros_like(self.prev_obs)
         self.last_action = np.zeros(4, dtype=np.float32)
         self._finished = False
+        self._step = 0

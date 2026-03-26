@@ -120,6 +120,7 @@ class RaceRewardAndObs(VectorEnv):
         spawn_offset: float = 0.75,
         spawn_pos_noise: float = 0.15,
         spawn_vel_noise: float = 0.3,
+        bilateral_progress: bool = False,
     ):
         self.env = env
         self.num_envs = env.num_envs
@@ -143,6 +144,7 @@ class RaceRewardAndObs(VectorEnv):
         self.spawn_offset = spawn_offset
         self.spawn_pos_noise = spawn_pos_noise
         self.spawn_vel_noise = spawn_vel_noise
+        self.bilateral_progress = bilateral_progress
         self._rng = np.random.default_rng()
 
         # Define the preprocessed observation space
@@ -239,7 +241,11 @@ class RaceRewardAndObs(VectorEnv):
         dist_xy = jp.linalg.norm(rel_pos[:, :2], axis=-1)
         if self.progress_coef > 0.0 and self._prev_dist is not None:
             # Potential-based reward shaping using horizontal distance only
-            proximity = self.progress_coef * jp.maximum(self._prev_dist - dist_xy, 0.0)
+            delta = self._prev_dist - dist_xy
+            if self.bilateral_progress:
+                proximity = self.progress_coef * delta  # reward closer, penalize farther
+            else:
+                proximity = self.progress_coef * jp.maximum(delta, 0.0)
         else:
             proximity = jp.exp(-self.proximity_coef * dist)
 
@@ -522,6 +528,7 @@ def make_race_envs(
         spawn_offset=coefs.get("spawn_offset", 0.75),
         spawn_pos_noise=coefs.get("spawn_pos_noise", 0.15),
         spawn_vel_noise=coefs.get("spawn_vel_noise", 0.3),
+        bilateral_progress=coefs.get("bilateral_progress", False),
     )
     env = RaceStackObs(env, n_obs=coefs.get("n_obs", 2))
     env = ActionPenalty(
