@@ -92,6 +92,8 @@ class Args:
     """the target KL divergence threshold"""
     max_logstd: float = None
     """clamp actor_logstd to this max value (None = no clamp)"""
+    hidden_size: int = 64
+    """hidden layer size for actor and critic networks (default 64, Swift uses 128)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -571,22 +573,22 @@ def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.
 class Agent(nn.Module):
     """RL Agent."""
 
-    def __init__(self, obs_shape: tuple, action_shape: tuple):
+    def __init__(self, obs_shape: tuple, action_shape: tuple, hidden_size: int = 64):
         """Init network structures."""
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(torch.tensor(obs_shape).prod(), 64)),
+            layer_init(nn.Linear(torch.tensor(obs_shape).prod(), hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(hidden_size, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(torch.tensor(obs_shape).prod(), 64)),
+            layer_init(nn.Linear(torch.tensor(obs_shape).prod(), hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, torch.tensor(action_shape).prod()), std=0.01),
+            layer_init(nn.Linear(hidden_size, torch.tensor(action_shape).prod()), std=0.01),
             nn.Tanh(),
         )
         self.actor_logstd = nn.Parameter(
@@ -623,7 +625,7 @@ class AsymmetricAgent(nn.Module):
     At inference, only the actor is used so privileged obs aren't needed.
     """
 
-    def __init__(self, obs_shape: tuple, action_shape: tuple, actor_obs_dim: int):
+    def __init__(self, obs_shape: tuple, action_shape: tuple, actor_obs_dim: int, hidden_size: int = 64):
         """Init with separate input dims for actor and critic."""
         super().__init__()
         total_dim = int(torch.tensor(obs_shape).prod())
@@ -632,19 +634,19 @@ class AsymmetricAgent(nn.Module):
 
         # Critic sees full obs (normal + privileged)
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(total_dim, 64)),
+            layer_init(nn.Linear(total_dim, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(hidden_size, 1), std=1.0),
         )
         # Actor sees only normal obs
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(actor_obs_dim, 64)),
+            layer_init(nn.Linear(actor_obs_dim, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, int(torch.tensor(action_shape).prod())), std=0.01),
+            layer_init(nn.Linear(hidden_size, int(torch.tensor(action_shape).prod())), std=0.01),
             nn.Tanh(),
         )
         self.actor_logstd = nn.Parameter(
@@ -701,7 +703,7 @@ def train_ppo(
         "only continuous action space is supported"
     )
 
-    agent = Agent(envs.single_observation_space.shape, envs.single_action_space.shape).to(device)
+    agent = Agent(envs.single_observation_space.shape, envs.single_action_space.shape, hidden_size=args.hidden_size).to(device)
     if args.max_logstd is not None:
         agent.max_logstd = args.max_logstd
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -896,7 +898,7 @@ def evaluate_ppo(args: Args, n_eval: int, model_path: Path) -> tuple[float, floa
         "act_coef": args.act_coef,
     }
     eval_env = make_envs(num_envs=1, coefs=r_coefs)
-    agent = Agent(eval_env.single_observation_space.shape, eval_env.single_action_space.shape).to(
+    agent = Agent(eval_env.single_observation_space.shape, eval_env.single_action_space.shape, hidden_size=args.hidden_size).to(
         device
     )
     agent.load_state_dict(torch.load(model_path))

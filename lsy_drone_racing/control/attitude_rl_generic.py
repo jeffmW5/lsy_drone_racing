@@ -67,12 +67,14 @@ class AttitudeRL(Controller):
             )
         state_dict = torch.load(model_path, map_location=torch.device("cpu"))
         actor_obs_dim = state_dict.get("_actor_obs_dim")
+        # Infer hidden_size from checkpoint weights (first hidden layer output dim)
+        hidden_size = int(state_dict["critic.0.weight"].shape[0])
         if actor_obs_dim is not None:
             actor_obs_dim = int(actor_obs_dim.item())
             total_dim = int(state_dict["critic.0.weight"].shape[1])
-            self.agent = AsymmetricAgent((total_dim,), (4,), actor_obs_dim=actor_obs_dim).to("cpu")
+            self.agent = AsymmetricAgent((total_dim,), (4,), actor_obs_dim=actor_obs_dim, hidden_size=hidden_size).to("cpu")
         else:
-            self.agent = Agent((obs_dim,), (4,)).to("cpu")
+            self.agent = Agent((obs_dim,), (4,), hidden_size=hidden_size).to("cpu")
         self.agent.load_state_dict(state_dict)
         self.last_action = np.array([0.0, 0.0, 0.0, self.drone_mass * 9.81], dtype=np.float32)
         self.basic_obs_key = ["pos", "quat", "vel", "ang_vel"]

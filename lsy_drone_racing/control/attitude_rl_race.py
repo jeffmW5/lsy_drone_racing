@@ -71,14 +71,16 @@ class AttitudeRL(Controller):
 
         # Load checkpoint — detect if asymmetric agent (has _actor_obs_dim buffer)
         ckpt = torch.load(model_path, map_location=torch.device("cpu"))
+        # Infer hidden_size from checkpoint weights
+        hidden_size = int(ckpt["critic.0.weight"].shape[0]) if "critic.0.weight" in ckpt else 64
         if "_actor_obs_dim" in ckpt:
             # Asymmetric agent: load only actor weights into standard Agent
-            self.agent = Agent((obs_dim,), (4,)).to("cpu")
+            self.agent = Agent((obs_dim,), (4,), hidden_size=hidden_size).to("cpu")
             actor_state = {k: v for k, v in ckpt.items()
                           if k.startswith("actor") and not k.startswith("_")}
             self.agent.load_state_dict(actor_state, strict=False)
         else:
-            self.agent = Agent((obs_dim,), (4,)).to("cpu")
+            self.agent = Agent((obs_dim,), (4,), hidden_size=hidden_size).to("cpu")
             self.agent.load_state_dict(ckpt)
         self.agent.eval()
 
