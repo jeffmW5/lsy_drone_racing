@@ -126,10 +126,21 @@ class AttitudeRL(Controller):
         obs_tensor = torch.tensor(obs_flat, dtype=torch.float32).unsqueeze(0)
 
         stochastic = os.environ.get("DRONE_RL_STOCHASTIC", "").lower() == "true"
+        noise_scale = float(os.environ.get("DRONE_RL_NOISE_SCALE", "0"))
         with torch.no_grad():
-            act, _, _, _ = self.agent.get_action_and_value(
-                obs_tensor, deterministic=not stochastic
-            )
+            if noise_scale > 0:
+                # Temperature-scaled sampling: mean + noise_scale * std * N(0,1)
+                action_mean = self.agent.actor_mean(obs_tensor)
+                action_logstd = self.agent.actor_logstd.expand_as(action_mean)
+                if hasattr(self.agent, "max_logstd"):
+                    action_logstd = torch.clamp(action_logstd, max=self.agent.max_logstd)
+                action_std = torch.exp(action_logstd)
+                noise = torch.randn_like(action_mean)
+                act = action_mean + noise_scale * action_std * noise
+            else:
+                act, _, _, _ = self.agent.get_action_and_value(
+                    obs_tensor, deterministic=not stochastic
+                )
             raw_action = act.squeeze(0).numpy().copy()
 
         # Store raw action for obs preprocessing (before yaw zeroing)

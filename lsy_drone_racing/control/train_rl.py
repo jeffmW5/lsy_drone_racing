@@ -82,6 +82,8 @@ class Args:
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.007
     """coefficient of the entropy"""
+    ent_coef_final: float = None
+    """final entropy coef when annealing (None = no annealing, use ent_coef throughout)"""
     vf_coef: float = 0.7
     """coefficient of the value function"""
     max_grad_norm: float = 1.5
@@ -642,7 +644,7 @@ class AsymmetricAgent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, int(torch.tensor(action_shape).prod()), std=0.01)),
+            layer_init(nn.Linear(64, int(torch.tensor(action_shape).prod())), std=0.01),
             nn.Tanh(),
         )
         self.actor_logstd = nn.Parameter(
@@ -729,10 +731,16 @@ def train_ppo(
         start_time = time.time()
 
         # Annealing the rate if instructed to do so.
+        frac = 1.0 - (iteration - 1.0) / args.num_iterations
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
+
+        # Entropy coefficient annealing (linear decay from ent_coef to ent_coef_final)
+        if args.ent_coef_final is not None:
+            ent_coef_now = args.ent_coef_final + frac * (args.ent_coef - args.ent_coef_final)
+        else:
+            ent_coef_now = args.ent_coef
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -833,7 +841,7 @@ def train_ppo(
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - ent_coef_now * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
