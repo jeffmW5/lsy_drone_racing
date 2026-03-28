@@ -69,10 +69,15 @@ class AttitudeRL(Controller):
                 "Set it to the path of the model.ckpt file."
             )
 
-        # Load checkpoint — detect if asymmetric agent (has _actor_obs_dim buffer)
+        # Load checkpoint — detect architecture from weights
         ckpt = torch.load(model_path, map_location=torch.device("cpu"))
-        # Infer hidden_size from checkpoint weights
+        # Infer hidden_size and obs_dim from checkpoint weights
         hidden_size = int(ckpt["critic.0.weight"].shape[0]) if "critic.0.weight" in ckpt else 64
+        ckpt_obs_dim = int(ckpt["actor_mean.0.weight"].shape[1]) if "actor_mean.0.weight" in ckpt else obs_dim
+        if ckpt_obs_dim != obs_dim:
+            # Auto-detect body_frame_obs from checkpoint obs dimension
+            self.body_frame_obs = (ckpt_obs_dim == 55)
+            obs_dim = ckpt_obs_dim
         if "_actor_obs_dim" in ckpt:
             # Asymmetric agent: load only actor weights into standard Agent
             self.agent = Agent((obs_dim,), (4,), hidden_size=hidden_size).to("cpu")
