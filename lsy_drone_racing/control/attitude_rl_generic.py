@@ -25,7 +25,7 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.train_rl import Agent
+from lsy_drone_racing.control.train_rl import Agent, AsymmetricAgent
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -56,8 +56,8 @@ class AttitudeRL(Controller):
         self._trajectory_built = False
         self.gate_aware = os.environ.get("DRONE_RL_GATE_AWARE", "false").lower() == "true"
 
-        # Load RL policy
-        self.agent = Agent((13 + 3 * self.n_samples + self.n_obs * 13 + 4,), (4,)).to("cpu")
+        # Load RL policy. Asymmetric-critic checkpoints need actor-only inference support.
+        obs_dim = 13 + 3 * self.n_samples + self.n_obs * 13 + 4
         model_path = os.environ.get("DRONE_RL_CKPT_PATH")
         if not model_path:
             # Fallback: look for the most recent checkpoint in results/
@@ -65,7 +65,15 @@ class AttitudeRL(Controller):
                 "DRONE_RL_CKPT_PATH environment variable not set. "
                 "Set it to the path of the model.ckpt file."
             )
-        self.agent.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+        state_dict = torch.load(model_path, map_location=torch.device("cpu"))
+        actor_obs_dim = state_dict.get("_actor_obs_dim")
+        if actor_obs_dim is not None:
+            actor_obs_dim = int(actor_obs_dim.item())
+            total_dim = int(state_dict["critic.0.weight"].shape[1])
+            self.agent = AsymmetricAgent((total_dim,), (4,), actor_obs_dim=actor_obs_dim).to("cpu")
+        else:
+            self.agent = Agent((obs_dim,), (4,)).to("cpu")
+        self.agent.load_state_dict(state_dict)
         self.last_action = np.array([0.0, 0.0, 0.0, self.drone_mass * 9.81], dtype=np.float32)
         self.basic_obs_key = ["pos", "quat", "vel", "ang_vel"]
         basic_obs = np.concatenate([obs[k] for k in self.basic_obs_key], axis=-1)
@@ -153,7 +161,11 @@ class AttitudeRL(Controller):
         obs_rl = self._obs_rl(obs)
         obs_rl = torch.tensor(obs_rl, dtype=torch.float32).unsqueeze(0).to("cpu")
         with torch.no_grad():
-            act, _, _, _ = self.agent.get_action_and_value(obs_rl, deterministic=True)
+            if hasattr(self.agent, "actor_obs_dim"):
+                actor_x = obs_rl[:, : self.agent.actor_obs_dim]
+                act = self.agent.actor_mean(actor_x)
+            else:
+                act, _, _, _ = self.agent.get_action_and_value(obs_rl, deterministic=True)
             self.last_action = np.asarray(torch.asarray(act.squeeze(0))).copy()
             act[..., 2] = 0.0
 
