@@ -69,6 +69,17 @@ class AttitudeRL(Controller):
         actor_obs_dim = state_dict.get("_actor_obs_dim")
         # Infer hidden_size from checkpoint weights (first hidden layer output dim)
         hidden_size = int(state_dict["critic.0.weight"].shape[0])
+
+        # Extract obs normalization stats if present (exp_071+)
+        self._obs_norm_mean = None
+        self._obs_norm_std = None
+        if "obs_norm_mean" in state_dict:
+            self._obs_norm_mean = state_dict.pop("obs_norm_mean").astype(np.float32)
+            obs_var = state_dict.pop("obs_norm_var").astype(np.float64)
+            self._obs_norm_std = np.sqrt(obs_var + 1e-8).astype(np.float32)
+            state_dict.pop("obs_norm_count", None)
+            print(f"[AttitudeRL] Loaded obs normalization stats (dim={len(self._obs_norm_mean)})")
+
         if actor_obs_dim is not None:
             actor_obs_dim = int(actor_obs_dim.item())
             total_dim = int(state_dict["critic.0.weight"].shape[1])
@@ -161,6 +172,8 @@ class AttitudeRL(Controller):
             self._finished = True
 
         obs_rl = self._obs_rl(obs)
+        if self._obs_norm_mean is not None:
+            obs_rl = np.clip((obs_rl - self._obs_norm_mean) / self._obs_norm_std, -10.0, 10.0)
         obs_rl = torch.tensor(obs_rl, dtype=torch.float32).unsqueeze(0).to("cpu")
         with torch.no_grad():
             if hasattr(self.agent, "actor_obs_dim"):

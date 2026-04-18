@@ -9,6 +9,7 @@ using VecDroneRaceEnv (MuJoCo physics, same as benchmark). Key differences:
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,8 +21,6 @@ from gymnasium.vector import VectorEnv, VectorObservationWrapper
 from gymnasium.vector.utils import batch_space
 from gymnasium.wrappers.vector.jax_to_torch import JaxToTorch
 from jax.scipy.spatial.transform import Rotation as R
-from scipy.spatial.transform import Rotation as ScipyR
-
 from lsy_drone_racing.control.train_rl import ActionPenalty, FlattenJaxObservation
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
 from lsy_drone_racing.utils import load_config
@@ -60,14 +59,10 @@ class NormalizeRaceActions(VectorEnv):
         return self.env.reset(**kwargs)
 
     def step(self, action):
-        # Zero out yaw command
-        if isinstance(action, np.ndarray):
-            action = action.copy()
-            action[..., 2] = 0.0
-        else:
-            action = action.at[..., 2].set(0.0)
-        # Scale from [-1, 1] to actual attitude bounds
-        scaled = np.asarray(action * self._scale + self._center)
+        action = jp.asarray(action)
+        action = action.at[..., 2].set(0.0)
+        # Scale from [-1, 1] to actual attitude bounds without host materialization.
+        scaled = action * self._scale + self._center
         return self.env.step(scaled)
 
     def close(self):
@@ -157,7 +152,7 @@ class RaceRewardAndObs(VectorEnv):
         self.asymmetric_critic = asymmetric_critic
         self._total_steps = 0
         self._last_privileged = None
-        self._rng = np.random.default_rng()
+        self._rng_key = jax.random.PRNGKey(0)
 
         # Define the preprocessed observation space
         if self.body_frame_obs:
@@ -192,54 +187,30 @@ class RaceRewardAndObs(VectorEnv):
         self.reward_mode = reward_mode
         self._was_done = None  # Track terminated|truncated for autoreset detection
 
-    def _preprocess_obs(self, obs: dict) -> dict:
-        """Convert RaceCoreEnv dict obs to relative-position obs."""
-        drone_pos = obs["pos"]  # (n_envs, 3)
-        drone_quat = obs["quat"]  # (n_envs, 4)
-        target_gate = obs["target_gate"]  # (n_envs,)
-        gates_pos = obs["gates_pos"]  # (n_envs, n_gates, 3)
-        gates_quat = obs["gates_quat"]  # (n_envs, n_gates, 4)
+    @staticmethod
+    @jax.jit
+    def _compute_prev_dist(pos, target_gate, gates_pos, n_gates: int):
+        safe_t = jp.clip(target_gate, 0, n_gates - 1)
+        target_pos = gates_pos[jp.arange(pos.shape[0]), safe_t]
+        rel = target_pos - pos
+        return jp.linalg.norm(rel[:, :2], axis=-1)
 
-        # Clamp to valid range (crashed/completed drones use last valid gate)
-        safe_target = jp.clip(target_gate, 0, self.n_gates - 1)
-        next_target = jp.clip(target_gate + 1, 0, self.n_gates - 1)
+    @staticmethod
+    @jax.jit
+    def _preprocess_obs_world(obs: dict, n_gates: int) -> dict:
+        drone_pos = obs["pos"]
+        target_gate = obs["target_gate"]
+        gates_pos = obs["gates_pos"]
+        gates_quat = obs["gates_quat"]
 
-        idx = jp.arange(self.num_envs)
+        safe_target = jp.clip(target_gate, 0, n_gates - 1)
+        next_target = jp.clip(target_gate + 1, 0, n_gates - 1)
+        idx = jp.arange(drone_pos.shape[0])
+
         target_pos = gates_pos[idx, safe_target]
         target_quat = gates_quat[idx, safe_target]
         next_pos = gates_pos[idx, next_target]
         next_quat = gates_quat[idx, next_target]
-
-        # Store privileged obs for asymmetric critic (all gate positions + quats)
-        if self.asymmetric_critic:
-            self._last_privileged = jp.concatenate([
-                gates_pos.reshape(self.num_envs, -1),   # (n_envs, n_gates*3)
-                gates_quat.reshape(self.num_envs, -1),  # (n_envs, n_gates*4)
-            ], axis=-1)
-
-        if self.body_frame_obs:
-            # Transform gate info to drone body frame
-            drone_rot_inv = R.from_quat(drone_quat).inv()
-            rel_target = target_pos - drone_pos
-            rel_next = next_pos - drone_pos
-            rel_target_body = drone_rot_inv.apply(rel_target)
-            rel_next_body = drone_rot_inv.apply(rel_next)
-            # Gate normals: x-axis of gate rotation, transformed to body frame
-            unit_x = jp.broadcast_to(jp.array([1.0, 0.0, 0.0]), drone_pos.shape)
-            target_fwd = R.from_quat(target_quat).apply(unit_x)
-            next_fwd = R.from_quat(next_quat).apply(unit_x)
-            target_normal_body = drone_rot_inv.apply(target_fwd)
-            next_normal_body = drone_rot_inv.apply(next_fwd)
-            return {
-                "pos": obs["pos"],
-                "quat": obs["quat"],
-                "vel": obs["vel"],
-                "ang_vel": obs["ang_vel"],
-                "rel_target_body": rel_target_body,
-                "target_normal_body": target_normal_body,
-                "rel_next_body": rel_next_body,
-                "next_normal_body": next_normal_body,
-            }
 
         return {
             "pos": obs["pos"],
@@ -252,7 +223,156 @@ class RaceRewardAndObs(VectorEnv):
             "next_gate_quat": next_quat,
         }
 
+    @staticmethod
+    @jax.jit
+    def _preprocess_obs_body(obs: dict, n_gates: int) -> dict:
+        drone_pos = obs["pos"]
+        drone_quat = obs["quat"]
+        target_gate = obs["target_gate"]
+        gates_pos = obs["gates_pos"]
+        gates_quat = obs["gates_quat"]
+
+        safe_target = jp.clip(target_gate, 0, n_gates - 1)
+        next_target = jp.clip(target_gate + 1, 0, n_gates - 1)
+        idx = jp.arange(drone_pos.shape[0])
+
+        target_pos = gates_pos[idx, safe_target]
+        target_quat = gates_quat[idx, safe_target]
+        next_pos = gates_pos[idx, next_target]
+        next_quat = gates_quat[idx, next_target]
+
+        drone_rot_inv = R.from_quat(drone_quat).inv()
+        rel_target_body = drone_rot_inv.apply(target_pos - drone_pos)
+        rel_next_body = drone_rot_inv.apply(next_pos - drone_pos)
+
+        unit_x = jp.broadcast_to(jp.array([1.0, 0.0, 0.0], dtype=drone_pos.dtype), drone_pos.shape)
+        target_fwd = R.from_quat(target_quat).apply(unit_x)
+        next_fwd = R.from_quat(next_quat).apply(unit_x)
+
+        return {
+            "pos": obs["pos"],
+            "quat": obs["quat"],
+            "vel": obs["vel"],
+            "ang_vel": obs["ang_vel"],
+            "rel_target_body": rel_target_body,
+            "target_normal_body": drone_rot_inv.apply(target_fwd),
+            "rel_next_body": rel_next_body,
+            "next_normal_body": drone_rot_inv.apply(next_fwd),
+        }
+
+    @staticmethod
+    @partial(
+        jax.jit,
+        static_argnames=("n_gates", "use_progress", "use_bilateral_progress", "use_view_multiply"),
+    )
+    def _compute_step_reward(
+        *,
+        obs: dict,
+        prev_target_gate,
+        prev_dist,
+        n_gates: int,
+        gate_bonus: float,
+        proximity_coef: float,
+        speed_coef: float,
+        rpy_coef: float,
+        oob_coef: float,
+        z_low: float,
+        z_high: float,
+        alt_coef: float,
+        survive_coef: float,
+        vz_coef: float,
+        vz_threshold: float,
+        progress_coef: float,
+        gate_in_view_coef: float,
+        use_progress: bool,
+        use_bilateral_progress: bool,
+        use_view_multiply: bool,
+        terminated,
+    ):
+        target_gate = obs["target_gate"]
+        gates_pos = obs["gates_pos"]
+        drone_pos = obs["pos"]
+        drone_vel = obs["vel"]
+        drone_quat = obs["quat"]
+
+        safe_target = jp.clip(target_gate, 0, n_gates - 1)
+        idx = jp.arange(drone_pos.shape[0])
+        target_pos = gates_pos[idx, safe_target]
+        rel_pos = target_pos - drone_pos
+        dist = jp.linalg.norm(rel_pos, axis=-1)
+        dist_xy = jp.linalg.norm(rel_pos[:, :2], axis=-1)
+
+        if use_progress:
+            delta = prev_dist - dist_xy
+            if use_bilateral_progress:
+                proximity = progress_coef * delta
+            else:
+                proximity = progress_coef * jp.maximum(delta, 0.0)
+        else:
+            proximity = jp.exp(-proximity_coef * dist)
+
+        direction = rel_pos / (dist[:, None] + 1e-6)
+        speed_toward = jp.sum(drone_vel * direction, axis=-1)
+        speed_reward = speed_coef * jp.maximum(speed_toward, 0.0)
+
+        gate_passed = (target_gate > prev_target_gate) & (prev_target_gate >= 0)
+        gate_reward = gate_bonus * gate_passed.astype(jp.float32)
+
+        rpy = R.from_quat(drone_quat).as_euler("xyz")
+        rpy_penalty = rpy_coef * jp.linalg.norm(rpy, axis=-1)
+
+        crash_penalty = terminated.astype(jp.float32)
+
+        z = drone_pos[:, 2]
+        oob_violation = (z > z_high) | (z < z_low)
+        oob_penalty = oob_coef * (
+            jp.maximum(z - z_high, 0.0) + jp.maximum(z_low - z, 0.0)
+        )
+        terminated = jp.where(oob_coef > 0, terminated | oob_violation, terminated)
+
+        alt_error = jp.abs(z - target_pos[:, 2])
+        alt_reward = alt_coef * jp.exp(-3.0 * alt_error)
+        survive_reward = survive_coef
+
+        vz_penalty = vz_coef * jp.maximum(drone_vel[:, 2], 0.0) * (
+            z > vz_threshold
+        ).astype(jp.float32)
+
+        rot_mat = R.from_quat(drone_quat).as_matrix()
+        drone_forward = rot_mat[:, :, 0]
+        gate_dir = rel_pos / (dist[:, None] + 1e-6)
+        alignment = jp.sum(drone_forward * gate_dir, axis=-1)
+        view_reward = gate_in_view_coef * jp.maximum(alignment, 0.0)
+
+        active = (target_gate >= 0).astype(jp.float32)
+        additive_reward = active * (
+            proximity + speed_reward + alt_reward + survive_reward + view_reward
+        )
+        multiplied_reward = active * (
+            view_reward * proximity + speed_reward + alt_reward + survive_reward
+        )
+        reward = jp.where(use_view_multiply, multiplied_reward, additive_reward)
+        reward = reward + gate_reward - crash_penalty - rpy_penalty - oob_penalty - vz_penalty
+
+        return reward, terminated, target_gate, dist_xy
+
+    def _preprocess_obs(self, obs: dict) -> dict:
+        """Convert RaceCoreEnv dict obs to relative-position obs."""
+        # Store privileged obs for asymmetric critic (all gate positions + quats)
+        if self.asymmetric_critic:
+            self._last_privileged = jp.concatenate([
+                obs["gates_pos"].reshape(self.num_envs, -1),   # (n_envs, n_gates*3)
+                obs["gates_quat"].reshape(self.num_envs, -1),  # (n_envs, n_gates*4)
+            ], axis=-1)
+
+        if self.body_frame_obs:
+            return self._preprocess_obs_body(obs, self.n_gates)
+        return self._preprocess_obs_world(obs, self.n_gates)
+
     def reset(self, **kwargs):
+        seed = kwargs.get("seed")
+        if seed is not None:
+            self._rng_key = jax.random.PRNGKey(int(seed))
         obs, info = self.env.reset(**kwargs)
         if self.random_gate_start:
             obs = self._apply_random_gate_start(obs)
@@ -260,11 +380,12 @@ class RaceRewardAndObs(VectorEnv):
         self._was_done = None
         # Initialize prev_dist for delta-progress reward (XY only — ignore altitude)
         if self.progress_coef > 0.0:
-            safe_t = jp.clip(jp.array(obs["target_gate"]), 0, self.n_gates - 1)
-            idx0 = jp.arange(self.num_envs)
-            t_pos = jp.array(obs["gates_pos"])[idx0, safe_t]
-            rel = t_pos - jp.array(obs["pos"])
-            self._prev_dist = jp.linalg.norm(rel[:, :2], axis=-1)
+            self._prev_dist = self._compute_prev_dist(
+                jp.array(obs["pos"]),
+                jp.array(obs["target_gate"]),
+                jp.array(obs["gates_pos"]),
+                self.n_gates,
+            )
         return self._preprocess_obs(obs), info
 
     def step(self, action):
@@ -286,99 +407,37 @@ class RaceRewardAndObs(VectorEnv):
                 )
                 # Sync _prev_dist for respawned envs (prevents spurious progress delta)
                 if self.progress_coef > 0.0 and self._prev_dist is not None:
-                    safe_t2 = jp.clip(new_target, 0, self.n_gates - 1)
-                    t_pos2 = jp.array(obs["gates_pos"])[jp.arange(self.num_envs), safe_t2]
-                    new_dist = jp.linalg.norm((t_pos2 - jp.array(obs["pos"]))[:, :2], axis=-1)
+                    new_dist = self._compute_prev_dist(
+                        jp.array(obs["pos"]),
+                        new_target,
+                        jp.array(obs["gates_pos"]),
+                        self.n_gates,
+                    )
                     self._prev_dist = jp.where(
                         jp.array(autoreset_mask), new_dist, self._prev_dist
                     )
-
-        target_gate = obs["target_gate"]  # (n_envs,)
-        gates_pos = obs["gates_pos"]  # (n_envs, n_gates, 3)
-        drone_pos = obs["pos"]  # (n_envs, 3)
-        drone_vel = obs["vel"]  # (n_envs, 3)
-        drone_quat = obs["quat"]  # (n_envs, 4)
-
-        # --- Gate proximity reward ---
-        safe_target = jp.clip(target_gate, 0, self.n_gates - 1)
-        idx = jp.arange(self.num_envs)
-        target_pos = gates_pos[idx, safe_target]
-        rel_pos = target_pos - drone_pos
-        dist = jp.linalg.norm(rel_pos, axis=-1)
-        # XY-only distance for progress reward — prevents gaming by falling
-        dist_xy = jp.linalg.norm(rel_pos[:, :2], axis=-1)
-        if self.progress_coef > 0.0 and self._prev_dist is not None:
-            # Potential-based reward shaping using horizontal distance only
-            delta = self._prev_dist - dist_xy
-            if self.bilateral_progress:
-                proximity = self.progress_coef * delta  # reward closer, penalize farther
-            else:
-                proximity = self.progress_coef * jp.maximum(delta, 0.0)
-        else:
-            proximity = jp.exp(-self.proximity_coef * dist)
-
-        # --- Speed toward gate ---
-        direction = rel_pos / (dist[:, None] + 1e-6)
-        speed_toward = jp.sum(drone_vel * direction, axis=-1)
-        speed_reward = self.speed_coef * jp.maximum(speed_toward, 0.0)
-
-        # --- Gate passage bonus ---
-        gate_passed = (target_gate > self._prev_target_gate) & (self._prev_target_gate >= 0)
-        gate_reward = self.gate_bonus * gate_passed.astype(jp.float32)
-
-        # --- RPY penalty ---
-        rpy = R.from_quat(drone_quat).as_euler("xyz")
-        rpy_penalty = self.rpy_coef * jp.linalg.norm(rpy, axis=-1)
-
-        # --- Crash penalty ---
-        crash_penalty = terminated.astype(jp.float32)
-
-        # --- Out-of-bounds altitude penalty + hard termination ---
-        z = drone_pos[:, 2]
-        oob_violation = (z > self.z_high) | (z < self.z_low)
-        oob_penalty = self.oob_coef * (
-            jp.maximum(z - self.z_high, 0.0) + jp.maximum(self.z_low - z, 0.0)
-        )
-        # Hard-terminate OOB drones (overrides grace period)
-        if self.oob_coef > 0:
-            terminated = terminated | oob_violation
-
-        # --- Altitude-matching reward: reward being at target gate's z ---
-        target_z = target_pos[:, 2]
-        alt_error = jp.abs(z - target_z)
-        alt_reward = self.alt_coef * jp.exp(-3.0 * alt_error)
-
-        # --- Survival bonus: reward for staying alive ---
-        survive_reward = self.survive_coef
-
-        # --- Vertical velocity penalty: penalize upward velocity when above threshold ---
-        vz = drone_vel[:, 2]
-        vz_penalty = self.vz_coef * jp.maximum(vz, 0.0) * (z > self.vz_threshold).astype(jp.float32)
-
-        # --- Gate-in-view reward: alignment of drone forward axis with direction to gate ---
-        if self.gate_in_view_coef > 0.0:
-            rot_mat = R.from_quat(drone_quat).as_matrix()  # (n_envs, 3, 3)
-            drone_forward = rot_mat[:, :, 0]  # body x-axis in world frame
-            gate_dir = rel_pos / (dist[:, None] + 1e-6)
-            alignment = jp.sum(drone_forward * gate_dir, axis=-1)  # cosine [-1, 1]
-            view_reward = self.gate_in_view_coef * jp.maximum(alignment, 0.0)
-        else:
-            view_reward = 0.0
-
-        # Only give proximity/speed/alt reward to active (non-crashed) drones
-        active = (target_gate >= 0).astype(jp.float32)
-        if self.reward_mode == "multiply" and self.gate_in_view_coef > 0.0:
-            # view * progress: zero reward unless both facing AND moving
-            reward = active * (view_reward * proximity + speed_reward + alt_reward + survive_reward)
-        else:
-            reward = active * (proximity + speed_reward + alt_reward + survive_reward + view_reward)
-        reward = (
-            reward
-            + gate_reward
-            - crash_penalty
-            - rpy_penalty
-            - oob_penalty
-            - vz_penalty
+        reward, terminated, target_gate, dist_xy = self._compute_step_reward(
+            obs=obs,
+            prev_target_gate=self._prev_target_gate,
+            prev_dist=self._prev_dist,
+            n_gates=self.n_gates,
+            gate_bonus=self.gate_bonus,
+            proximity_coef=self.proximity_coef,
+            speed_coef=self.speed_coef,
+            rpy_coef=self.rpy_coef,
+            oob_coef=self.oob_coef,
+            z_low=self.z_low,
+            z_high=self.z_high,
+            alt_coef=self.alt_coef,
+            survive_coef=self.survive_coef,
+            vz_coef=self.vz_coef,
+            vz_threshold=self.vz_threshold,
+            progress_coef=self.progress_coef,
+            gate_in_view_coef=self.gate_in_view_coef,
+            use_progress=self.progress_coef > 0.0 and self._prev_dist is not None,
+            use_bilateral_progress=self.bilateral_progress,
+            use_view_multiply=self.reward_mode == "multiply" and self.gate_in_view_coef > 0.0,
+            terminated=terminated,
         )
 
         # === SOFT COLLISION: suppress termination during phase 1 ===
@@ -414,68 +473,87 @@ class RaceRewardAndObs(VectorEnv):
             mask: Boolean array (n_envs,) — only modify envs where True.
                   If None, apply to random_gate_ratio fraction of envs.
         """
+        self._rng_key, mask_key = jax.random.split(self._rng_key)
+        random_mask = jax.random.uniform(mask_key, (self.num_envs,)) < self.random_gate_ratio
         if mask is None:
-            # Initial reset: apply to random_gate_ratio fraction
-            mask = self._rng.random(self.num_envs) < self.random_gate_ratio
+            mask = random_mask
         else:
-            # Autoreset: apply ratio within the autoreset mask
-            mask = mask & (self._rng.random(self.num_envs) < self.random_gate_ratio)
-        n_reset = int(mask.sum())
-        if n_reset == 0:
+            mask = jp.asarray(mask) & random_mask
+
+        if not bool(jp.any(mask)):
             return obs
 
-        # Pick random gates for reset envs
-        spawn_gates_full = np.array(obs["target_gate"], dtype=int)
-        spawn_gates_full[mask] = self._rng.integers(0, self.n_gates, size=n_reset)
+        self._rng_key, gate_key, pos_key, vel_key, angle_key = jax.random.split(
+            self._rng_key, 5
+        )
 
-        gates_pos = np.array(obs["gates_pos"])  # (n_envs, n_gates, 3)
-        gates_quat = np.array(obs["gates_quat"])  # (n_envs, n_gates, 4) scipy order
+        target_gate = jp.asarray(obs["target_gate"], dtype=jp.int32)
+        gates_pos = jp.asarray(obs["gates_pos"])
+        gates_quat = jp.asarray(obs["gates_quat"])
 
-        idx = np.arange(self.num_envs)
-        target_pos = gates_pos[idx, spawn_gates_full]  # (n_envs, 3)
-        target_quat = gates_quat[idx, spawn_gates_full]  # (n_envs, 4)
+        random_gates = jax.random.randint(gate_key, (self.num_envs,), 0, self.n_gates)
+        spawn_gates_full = jp.where(mask, random_gates, target_gate)
+
+        idx = jp.arange(self.num_envs)
+        target_pos = gates_pos[idx, spawn_gates_full]
+        target_quat = gates_quat[idx, spawn_gates_full]
 
         # Gate forward = local x-axis (gates are crossed -x → +x)
-        gate_rot = ScipyR.from_quat(target_quat)
-        forward = gate_rot.apply(np.array([1.0, 0.0, 0.0]))  # (n_envs, 3)
+        gate_rot = R.from_quat(target_quat)
+        unit_x = jp.broadcast_to(jp.array([1.0, 0.0, 0.0], dtype=target_pos.dtype), target_pos.shape)
+        forward = gate_rot.apply(unit_x)
 
         # Spawn position: offset before gate + noise
         spawn_pos = target_pos - self.spawn_offset * forward
-        pos_noise = self._rng.uniform(
-            -self.spawn_pos_noise, self.spawn_pos_noise, size=(self.num_envs, 3)
+        pos_noise = jax.random.uniform(
+            pos_key,
+            (self.num_envs, 3),
+            minval=-self.spawn_pos_noise,
+            maxval=self.spawn_pos_noise,
         )
         spawn_pos += pos_noise
 
         # Drone orientation: face the gate (match gate yaw) + perturbation
-        gate_euler = gate_rot.as_euler("xyz")  # (n_envs, 3)
-        drone_rpy = np.zeros((self.num_envs, 3), dtype=np.float64)
-        drone_rpy[:, 2] = gate_euler[:, 2]  # Match gate yaw
-        drone_rpy[:, 0] += self._rng.uniform(-np.radians(5), np.radians(5), size=self.num_envs)
-        drone_rpy[:, 1] += self._rng.uniform(-np.radians(5), np.radians(5), size=self.num_envs)
-        drone_rpy[:, 2] += self._rng.uniform(-np.radians(15), np.radians(15), size=self.num_envs)
-        drone_quat = ScipyR.from_euler("xyz", drone_rpy).as_quat()  # (n_envs, 4)
+        gate_euler = gate_rot.as_euler("xyz")
+        angle_min = jp.array(
+            [-np.radians(5), -np.radians(5), -np.radians(15)], dtype=target_pos.dtype
+        )
+        angle_max = jp.array(
+            [np.radians(5), np.radians(5), np.radians(15)], dtype=target_pos.dtype
+        )
+        angle_noise = jax.random.uniform(
+            angle_key,
+            (self.num_envs, 3),
+            minval=angle_min,
+            maxval=angle_max,
+        )
+        drone_rpy = angle_noise.at[:, 2].add(gate_euler[:, 2])
+        drone_quat = R.from_euler("xyz", drone_rpy).as_quat()
 
         # Spawn velocity: small random
-        spawn_vel = self._rng.uniform(
-            -self.spawn_vel_noise, self.spawn_vel_noise, size=(self.num_envs, 3)
+        spawn_vel = jax.random.uniform(
+            vel_key,
+            (self.num_envs, 3),
+            minval=-self.spawn_vel_noise,
+            maxval=self.spawn_vel_noise,
         )
 
         # Merge with existing state for non-masked envs
         core_env = self.env.unwrapped
-        old_pos = np.array(core_env.sim.data.states.pos[:, 0])
-        old_quat = np.array(core_env.sim.data.states.quat[:, 0])
-        old_vel = np.array(core_env.sim.data.states.vel[:, 0])
+        old_pos = core_env.sim.data.states.pos[:, 0]
+        old_quat = core_env.sim.data.states.quat[:, 0]
+        old_vel = core_env.sim.data.states.vel[:, 0]
 
-        new_pos = np.where(mask[:, None], spawn_pos, old_pos).astype(np.float32)
-        new_quat = np.where(mask[:, None], drone_quat, old_quat).astype(np.float32)
-        new_vel = np.where(mask[:, None], spawn_vel, old_vel).astype(np.float32)
+        new_pos = jp.where(mask[:, None], spawn_pos, old_pos).astype(jp.float32)
+        new_quat = jp.where(mask[:, None], drone_quat, old_quat).astype(jp.float32)
+        new_vel = jp.where(mask[:, None], spawn_vel, old_vel).astype(jp.float32)
 
         # Override sim state
         pos = core_env.sim.data.states.pos.at[:, 0, :].set(new_pos)
         quat = core_env.sim.data.states.quat.at[:, 0, :].set(new_quat)
         vel = core_env.sim.data.states.vel.at[:, 0, :].set(new_vel)
         ang_vel = core_env.sim.data.states.ang_vel.at[:, 0, :].set(
-            np.zeros((self.num_envs, 3), dtype=np.float32)
+            jp.zeros((self.num_envs, 3), dtype=jp.float32)
         )
         core_env.sim.data = core_env.sim.data.replace(
             states=core_env.sim.data.states.replace(
@@ -484,10 +562,10 @@ class RaceRewardAndObs(VectorEnv):
         )
 
         # Override target gate and last_drone_pos
-        old_target = np.array(core_env.data.target_gate[:, 0])
-        new_target = np.where(mask, spawn_gates_full, old_target).astype(int)
+        old_target = core_env.data.target_gate[:, 0]
+        new_target = jp.where(mask, spawn_gates_full, old_target).astype(jp.int32)
         core_env.data = core_env.data.replace(
-            target_gate=jp.array(new_target[:, None]),
+            target_gate=new_target[:, None],
             last_drone_pos=pos,
         )
 
