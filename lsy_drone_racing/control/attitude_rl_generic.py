@@ -65,7 +65,7 @@ class AttitudeRL(Controller):
                 "DRONE_RL_CKPT_PATH environment variable not set. "
                 "Set it to the path of the model.ckpt file."
             )
-        state_dict = torch.load(model_path, map_location=torch.device("cpu"))
+        state_dict = torch.load(model_path, map_location=torch.device("cpu"), weights_only=False)
         actor_obs_dim = state_dict.get("_actor_obs_dim")
         # Infer hidden_size from checkpoint weights (first hidden layer output dim)
         hidden_size = int(state_dict["critic.0.weight"].shape[0])
