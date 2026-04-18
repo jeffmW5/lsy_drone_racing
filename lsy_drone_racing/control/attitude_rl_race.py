@@ -70,7 +70,7 @@ class AttitudeRL(Controller):
             )
 
         # Load checkpoint — detect architecture from weights
-        ckpt = torch.load(model_path, map_location=torch.device("cpu"))
+        ckpt = torch.load(model_path, map_location=torch.device("cpu"), weights_only=False)
         # Infer hidden_size and obs_dim from checkpoint weights
         hidden_size = int(ckpt["critic.0.weight"].shape[0]) if "critic.0.weight" in ckpt else 64
         ckpt_obs_dim = int(ckpt["actor_mean.0.weight"].shape[1]) if "actor_mean.0.weight" in ckpt else obs_dim
@@ -78,6 +78,17 @@ class AttitudeRL(Controller):
             # Auto-detect body_frame_obs from checkpoint obs dimension
             self.body_frame_obs = (ckpt_obs_dim == 55)
             obs_dim = ckpt_obs_dim
+
+        # Extract obs normalization stats if present (exp_071+)
+        self._obs_norm_mean = None
+        self._obs_norm_std = None
+        if "obs_norm_mean" in ckpt:
+            self._obs_norm_mean = ckpt.pop("obs_norm_mean").astype(np.float32)
+            obs_var = ckpt.pop("obs_norm_var").astype(np.float64)
+            self._obs_norm_std = np.sqrt(obs_var + 1e-8).astype(np.float32)
+            ckpt.pop("obs_norm_count", None)
+            print(f"[AttitudeRL] Loaded obs normalization stats (dim={len(self._obs_norm_mean)})")
+
         if "_actor_obs_dim" in ckpt:
             # Asymmetric agent: load only actor weights into standard Agent
             self.agent = Agent((obs_dim,), (4,), hidden_size=hidden_size).to("cpu")
@@ -130,6 +141,8 @@ class AttitudeRL(Controller):
 
         # RL policy phase
         obs_flat = self._preprocess_obs(obs)
+        if self._obs_norm_mean is not None:
+            obs_flat = np.clip((obs_flat - self._obs_norm_mean) / self._obs_norm_std, -10.0, 10.0)
         obs_tensor = torch.tensor(obs_flat, dtype=torch.float32).unsqueeze(0)
 
         stochastic = os.environ.get("DRONE_RL_STOCHASTIC", "").lower() == "true"

@@ -80,6 +80,11 @@ class AttitudeRL(Controller):
             state_dict.pop("obs_norm_count", None)
             print(f"[AttitudeRL] Loaded obs normalization stats (dim={len(self._obs_norm_mean)})")
 
+        # Infer obs_dim from checkpoint weights (handles both trajectory=73 and race=55)
+        ckpt_obs_dim = int(state_dict["critic.0.weight"].shape[1])
+        if ckpt_obs_dim != obs_dim:
+            obs_dim = ckpt_obs_dim
+
         if actor_obs_dim is not None:
             actor_obs_dim = int(actor_obs_dim.item())
             total_dim = int(state_dict["critic.0.weight"].shape[1])
